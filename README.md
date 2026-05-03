@@ -8,9 +8,17 @@ Simple toy model for illustration purpose
 
 - - - 
 
+## Conv-NTK Model
+
+Illustration of effective label shifts and their full and iterative corrections using Neural Tangent Kernel (NTK) of a shallow convolutional neural network, applied to MNIST dataset. 
+
+NTK was estimated using [neural_tangents library](https://github.com/google/neural-tangents) and implemented with JAX. 
+
+- - - 
+
 ## Image Classification
 
-This repository contains two command-line entry scripts and a small `src` library for streaming SGD, target correction, EWC, and result plotting on **MNIST**, **CIFAR-10**, and **CORe50**-style pipelines.
+This directory contains two command-line entry scripts and a small `src` library for streaming SGD, target correction, EWC, and result plotting on **MNIST**, **CIFAR-10**, and **CORe50**-style pipelines.
 
 ## Layout
 
@@ -38,7 +46,7 @@ This repository contains two command-line entry scripts and a small `src` librar
 
 ## Running
 
-From the repository root (same directory as the `main_*.py` files):
+From the directory root (same directory as the `main_*.py` files):
 
 ```bash
 python main_cifar10_mnist.py --help
@@ -52,8 +60,4 @@ Typical knobs include dataset (`--ds_type`), stream order (`--train_order_type`)
 - **MNIST / CIFAR-10**: torchvision will download under `./data` (or your chosen `--root`) when missing; on clusters without reliable outbound HTTP, pre-stage the dataset there.
 - **CORe50**: configure paths and preprocessing as required by `src/dataset.py` for your environment.
 
-- - - 
 
-## System Requirements
-
-- - -

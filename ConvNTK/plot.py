@@ -158,7 +158,7 @@ def plot_label_shift_35( rng, Ytrue, Yeff, Yc, hy_params, with_correction, Nplot
                     + '_eta' + f"{eta:.3f}" + '_Nplot' + str(Nplot) + '.pdf' )
 
 
-# plotting the label shift in the direction of y0, ..., y4
+# plotting the label shift in the direction of y0, y1, y2
 def plot_label_shift_0to4( rng, Ytrue, Yeff, Yc, hy_params, with_correction, Nplot=10 ):
     Ntrain, Ntest, Nb = hy_params['Ntrain'], hy_params['Ntest'], hy_params['Nb']
     

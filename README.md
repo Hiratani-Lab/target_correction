@@ -8,6 +8,11 @@ Simple toy model for illustration purpose
 
 - - - 
 
+## Image Classification
+
+
+- - - 
+
 ## System Requirements
 
 - - -

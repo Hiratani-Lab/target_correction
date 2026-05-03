@@ -15,7 +15,7 @@ import tensorflow as tf
 tf.config.set_visible_devices([], device_type='GPU')
 import tensorflow_datasets as tfds
 
-data_dir = '/tmp/tfds' #'/storage1/fs1/hiratani/Active/shared/tfds'
+data_dir = '/tmp/tfds'
 
 
 def one_hot(x, k, dtype=jnp.float32):

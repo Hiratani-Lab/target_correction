@@ -4,15 +4,15 @@ Code associated with the project on the effective target shift in online learnin
 
 ## Toy Model
 
-Simple toy model for illustration purpose
+Simple toy model for illustrative purposes
 
 - - - 
 
 ## Conv-NTK Model
 
-Illustration of effective label shifts and their full and iterative corrections using Neural Tangent Kernel (NTK) of a shallow convolutional neural network, applied to MNIST dataset. 
+Illustration of effective label shifts and their full and iterative corrections using Neural Tangent Kernel (NTK) of a shallow convolutional neural network, applied to the MNIST dataset. 
 
-NTK was estimated using [neural_tangents library](https://github.com/google/neural-tangents) and implemented with JAX. 
+NTK was estimated using the [neural_tangents library](https://github.com/google/neural-tangents) and implemented with JAX. 
 
 - - - 
 

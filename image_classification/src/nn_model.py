@@ -1691,7 +1691,7 @@ def sgd_train_streaming_gating_ewc(model, X_train, y_train, X_test, y_test, Nite
                     print(f"\n--- New Task Started (N={N-dN}) ---")
                     # Use .item() to extract the clean float value from the PyTorch tensor
                     print(f"Classification Loss: {loss_cls.item():.6f}")
-                    print(f"EWC Loss (\u03BB=1):      {loss_ewc.item():.6f}")
+                    print(f"EWC Loss:      {loss_ewc.item():.6f}")
                     print(f"Total Loss:          {loss.item():.6f}\n")
             else:
                 loss = loss_cls

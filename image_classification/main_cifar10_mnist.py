@@ -1,4 +1,5 @@
 import argparse
+import csv
 import math
 import numpy as np
 import matplotlib.pyplot as plt
@@ -6,6 +7,7 @@ import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'src'))
 import torch
 from nn_model import one_hot, sgd_train_streaming_gating_ewc, sgd_train_streaming_gating_ewc_cumulative, sgd_train_streaming_MSE_fixed_kernel_f0, compute_corrected_Z_iter, compute_corrected_Z_full, sgd_train_streaming_MSE_on_cor_adap_kernel
+from nn_model import sgd_train_streaming_label_smooth, sgd_train_streaming_er, sgd_train_streaming_der, sgd_train_streaming_der_cor
 from nn_model import krr_predict_precomputed, on_predict_eq1_precomputed, on_predict_classwise, krr_predict_classwise, SmallCNN_model, sgd_train_streaming_gating_ewc_epochs
 from nn_model import sgd_train_streaming_MSE_online_correction_epochs, kernel_type
 from dataset import make_order_multiclass, load_ds
@@ -681,6 +683,32 @@ def run_sgd_one_param(sgd_eta=0.1, sgd_gamma=0.1, sgd_lr=0.001, hy_params_vanill
                                                                                                                                 sgd_on_gm=sgd_gamma, sgd_on_eta=sgd_eta, online_cor_type=online_cor_type)
                 steps = Niters
             save_correction_one_seed_csv(steps, sgd_tr_cor_curve, sgd_te_cor_curve, sgd_eta, sgd_gamma, label_correction_type, sd, save_dir)
+        elif label_correction_type == 'label_smooth':
+            if hy_params['epochs'] != 1:
+                raise ValueError("label_smooth requires epochs==1")
+            sgd_tr_cor_curve, sgd_te_cor_curve, sgd_tr_cor_mse, sgd_te_cor_mse = sgd_train_streaming_label_smooth(
+                model_sgd_cor, X_train, y_train, X_test, y_test, Niters, hy_params,
+                epsilon=float(hy_params['label_smoothing_epsilon']), gate_mode=gate_mode)
+            steps = Niters
+        elif label_correction_type == 'ER':
+            if hy_params['epochs'] != 1:
+                raise ValueError("ER requires epochs==1")
+            sgd_tr_cor_curve, sgd_te_cor_curve, sgd_tr_cor_mse, sgd_te_cor_mse = sgd_train_streaming_er(
+                model_sgd_cor, X_train, y_train, X_test, y_test, Niters, hy_params, gate_mode)
+            steps = Niters
+        elif label_correction_type in ('DER', 'DER++'):
+            if hy_params['epochs'] != 1:
+                raise ValueError(f"{label_correction_type} requires epochs==1")
+            sgd_tr_cor_curve, sgd_te_cor_curve, sgd_tr_cor_mse, sgd_te_cor_mse = sgd_train_streaming_der(
+                model_sgd_cor, X_train, y_train, X_test, y_test, Niters, hy_params, gate_mode)
+            steps = Niters
+        elif label_correction_type == 'DER_cor':
+            if hy_params['epochs'] != 1:
+                raise ValueError("DER_cor requires epochs==1")
+            sgd_tr_cor_curve, sgd_te_cor_curve, sgd_tr_cor_mse, sgd_te_cor_mse = sgd_train_streaming_der_cor(
+                model_sgd_cor, X_train, y_train, X_test, y_test, Niters, hy_params,
+                sgd_on_gm=sgd_gamma, sgd_on_eta=sgd_eta, online_cor_type=online_cor_type, gate_mode=gate_mode)
+            steps = Niters
         elif label_correction_type == 'cumulative':
             if hy_params['train_order_type'] != 'task_incremental':
                 raise ValueError("cumulative only supports train_order_type=='task_incremental'")
@@ -707,6 +735,95 @@ def run_sgd_one_param(sgd_eta=0.1, sgd_gamma=0.1, sgd_lr=0.001, hy_params_vanill
     sgd_te_mse_m, sgd_te_mse_s = mean_and_sem(sgd_te_mse_cor_all)
 
     return steps, sgd_tr_cor_m, sgd_tr_cor_s, sgd_te_cor_m, sgd_te_cor_s, sgd_tr_mse_m, sgd_tr_mse_s, sgd_te_mse_m, sgd_te_mse_s
+
+def _write_curve_csv(path, steps, tr_m, tr_s, te_m, te_s, extra):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fields = ["step", "train_acc_mean", "train_acc_sem", "test_acc_mean", "test_acc_sem", *list(extra.keys())]
+    with open(path, "w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        for i, step in enumerate(steps):
+            row = {
+                "step": int(step),
+                "train_acc_mean": float(tr_m[i]),
+                "train_acc_sem": float(tr_s[i]),
+                "test_acc_mean": float(te_m[i]),
+                "test_acc_sem": float(te_s[i]),
+            }
+            row.update(extra)
+            writer.writerow(row)
+    print(f"Saved {path}")
+
+def run_streaming_replay_csv(args, hy_params_vanilla):
+    method = args.label_correction_type
+    root = (
+        f"results_{hy_params_vanilla['ds_type']}_{hy_params_vanilla['criterion']}"
+        f"_Ntr{hy_params_vanilla['Ntrain']}_seeds{hy_params_vanilla['ikmax']}"
+        f"_sgd_bz{hy_params_vanilla['sgd_batch_size']}_epochs{hy_params_vanilla['epochs']}"
+        f"/{method}"
+    )
+    for sgd_lr in args.sgd_lr_list:
+        if method == 'label_smooth':
+            settings = [{"label_smoothing_epsilon": eps} for eps in args.label_smoothing_epsilon_list]
+        elif method == 'ER':
+            settings = [
+                {"der_buffer_size": m_buf, "der_replay_batch_size": m_rep, "der_alpha": alpha}
+                for m_buf in args.der_buffer_size_list
+                for m_rep in args.der_replay_batch_size_list
+                for alpha in args.der_alpha_list
+            ]
+        elif method in ('DER', 'DER_cor'):
+            settings = [
+                {"der_buffer_size": m_buf, "der_replay_batch_size": m_rep, "der_alpha": alpha}
+                for m_buf in args.der_buffer_size_list
+                for m_rep in args.der_replay_batch_size_list
+                for alpha in args.der_alpha_list
+            ]
+        else:
+            settings = [
+                {
+                    "der_buffer_size": m_buf,
+                    "der_replay_batch_size": m_rep,
+                    "der_alpha": alpha,
+                    "der_beta": beta,
+                }
+                for m_buf in args.der_buffer_size_list
+                for m_rep in args.der_replay_batch_size_list
+                for alpha in args.der_alpha_list
+                for beta in args.der_beta_list
+            ]
+        for setting in settings:
+            hy = hy_params_vanilla.copy()
+            hy.update(setting)
+            hy['sgd_lr'] = sgd_lr
+            steps, tr_m, tr_s, te_m, te_s, _, _, _, _ = run_sgd_one_param(
+                sgd_eta=args.sgd_eta, sgd_gamma=args.sgd_gamma, sgd_lr=sgd_lr,
+                hy_params_vanilla=hy, label_correction_type=method,
+                order_type=hy['train_order_type'], gate_frac=1, gate_mode='none',
+                ewc_lambda=0, online_cor_type=hy['online_cor_type'], save_dir=root,
+            )
+            extra = {"sgd_lr": sgd_lr, "method": method}
+            extra.update(setting)
+            if method == 'label_smooth':
+                name = f"sgd_label_smooth_lr{sgd_lr:g}_eps{float(setting['label_smoothing_epsilon']):g}_stat.csv"
+            elif method == 'ER':
+                name = (
+                    f"sgd_ER_lr{sgd_lr:g}_M{setting['der_buffer_size']}"
+                    f"_m{setting['der_replay_batch_size']}_alpha{float(setting['der_alpha']):g}_stat.csv"
+                )
+            elif method in ('DER', 'DER_cor'):
+                tag = "DER_cor" if method == "DER_cor" else "DER"
+                name = (
+                    f"sgd_{tag}_lr{sgd_lr:g}_M{setting['der_buffer_size']}"
+                    f"_m{setting['der_replay_batch_size']}_alpha{float(setting['der_alpha']):g}_stat.csv"
+                )
+            else:
+                name = (
+                    f"sgd_DER++_lr{sgd_lr:g}_M{setting['der_buffer_size']}"
+                    f"_m{setting['der_replay_batch_size']}_alpha{float(setting['der_alpha']):g}"
+                    f"_beta{float(setting['der_beta']):g}_stat.csv"
+                )
+            _write_curve_csv(os.path.join(root, name), steps, tr_m, tr_s, te_m, te_s, extra)
 
 from plot import save_classification_csv, save_classification_vanilla_csv, save_classification_cumulative_csv, save_classification_ewc_csv, save_classification_gating_csv
 from plot import save_sgd_cumulative_one_seed_csv
@@ -1475,7 +1592,12 @@ if __name__ == "__main__":
     parser.add_argument('--sgd_batch_size', type=int, default=1,    help='SGD mini-batch size')
     parser.add_argument('--z_mini_bz',      type=int, default=1,    help='Mini-batch size for KbU masking')
     parser.add_argument('--label_correction_type', type=str, default='online_correction',
-                        help='online_correction | none | cumulative (task_incr+epochs1: vanilla + cumulative replay; use --replay_schedule)')
+                        help='online_correction | none | cumulative | label_smooth | ER | DER | DER++')
+    parser.add_argument('--label_smoothing_epsilon_list', type=float, nargs='+', default=[0.1])
+    parser.add_argument('--der_buffer_size_list', type=int, nargs='+', default=[300])
+    parser.add_argument('--der_replay_batch_size_list', type=int, nargs='+', default=[4])
+    parser.add_argument('--der_alpha_list', type=float, nargs='+', default=[1.0])
+    parser.add_argument('--der_beta_list', type=float, nargs='+', default=[1.0])
     parser.add_argument('--sgd_lr_list', type=float, nargs='+',
                         default=[0.0001, 0.0003, 0.001, 0.003, 0.01, 0.02, 0.05],
                         help='SGD learning rates to sweep (space-separated)')
@@ -1571,7 +1693,11 @@ if __name__ == "__main__":
     sgd_lr_list = args.sgd_lr_list
     label_correction_type = args.label_correction_type
 
-    if hy_params_vanilla['train_order_type'] == 'random':
+    if label_correction_type in ('label_smooth', 'ER', 'DER', 'DER++', 'DER_cor'):
+        if hy_params_vanilla['epochs'] != 1:
+            raise ValueError(f"{label_correction_type} requires epochs==1")
+        run_streaming_replay_csv(args, hy_params_vanilla)
+    elif hy_params_vanilla['train_order_type'] == 'random':
         if hy_params_vanilla['epochs']==1:
             if label_correction_type == 'online_correction':
                 hy_params_vanilla.update({'fixed_first_ep_kernel': True})

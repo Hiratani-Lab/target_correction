@@ -11,6 +11,7 @@ import warnings
 from pathlib import Path
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'src'))
 from nn_model import train_core50_van_sgd, train_core50_van_sgd_cumulative, train_core50_van_sgd_ewc, build_resnet18_model
+from nn_model import train_core50_label_smooth, train_core50_er, train_core50_der, train_core50_der_cor
 from dataset import load_core50_subset_whitened
 warnings.filterwarnings("ignore", message=".*tf.NodeDef is deprecated.*")
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
@@ -320,6 +321,88 @@ def save_on_cor_to_csv(
 
     print(f"Successfully saved results to: {filepath}")
 
+def core50_replay_one_param(sgd_lr, hy_params_vanilla, method):
+    hy_params = hy_params_vanilla.copy()
+    hy_params.update({'sgd_lr': sgd_lr})
+    num_epochs, batch_size = hy_params['epochs'], hy_params['sgd_batch_size']
+    device, num_seeds = hy_params['device'], hy_params['ikmax']
+    frames_per_session = hy_params['frames_per_session']
+    num_tr_per_task = 8 * frames_per_session
+    train_all, test_all = [], []
+    for sd in range(num_seeds):
+        print("current seed:", sd)
+        model = build_resnet18_model(
+            device, num_classes=50, use2dense=hy_params['use2dense'], hidden_dim=100,
+            bias_flag=hy_params["bias_dense"], update_cnn=hy_params['update_cnn'],
+        )
+        X_train, y_train, X_test, y_test, _, _ = load_core50_subset_whitened(
+            n_train=None, n_test=None, npz_path="core50_imgs.npz", pkl_path="paths.pkl",
+            frames_per_session=frames_per_session, img_size=224, seed_select=sd, device=device,
+        )
+        if method == 'label_smooth':
+            train_accs, test_accs, _, _ = train_core50_label_smooth(
+                model, X_train, y_train, X_test, y_test, hy_params, num_epochs, batch_size, num_tr_per_task)
+        elif method == 'ER':
+            train_accs, test_accs, _, _ = train_core50_er(
+                model, X_train, y_train, X_test, y_test, hy_params, num_epochs, batch_size, num_tr_per_task)
+        elif method == 'DER_cor':
+            train_accs, test_accs, _, _ = train_core50_der_cor(
+                model, X_train, y_train, X_test, y_test, hy_params, num_epochs, batch_size, num_tr_per_task,
+                sgd_on_gm=hy_params['sgd_gamma'], sgd_on_eta=hy_params['sgd_eta'],
+                online_cor_type=hy_params['online_cor_type'])
+        else:
+            train_accs, test_accs, _, _ = train_core50_der(
+                model, X_train, y_train, X_test, y_test, hy_params, num_epochs, batch_size, num_tr_per_task)
+        train_all.append(train_accs)
+        test_all.append(test_accs)
+    tr_m, tr_s = mean_and_sem(np.array(train_all))
+    te_m, te_s = mean_and_sem(np.array(test_all))
+    return range(1, 10), tr_m, tr_s, te_m, te_s
+
+def save_core50_replay_csv(steps, tr_m, tr_s, te_m, te_s, sgd_lr, hy_params, method):
+    root = (
+        f"results/core50_{hy_params['criterion']}_Ntr6000_seeds{hy_params['ikmax']}"
+        f"_sgd_bz{hy_params['sgd_batch_size']}_epochs{hy_params['epochs']}"
+        f"_frame{hy_params['frames_per_session']}/{method}"
+    )
+    os.makedirs(root, exist_ok=True)
+    if method == 'label_smooth':
+        name = f"sgd_label_smooth_lr{sgd_lr:g}_eps{float(hy_params['label_smoothing_epsilon']):g}_stat.csv"
+    elif method == 'ER':
+        name = (
+            f"sgd_ER_lr{sgd_lr:g}_M{hy_params['der_buffer_size']}"
+            f"_m{hy_params['der_replay_batch_size']}_alpha{float(hy_params['der_alpha']):g}_stat.csv"
+        )
+    elif method == 'DER':
+        name = (
+            f"sgd_DER_lr{sgd_lr:g}_M{hy_params['der_buffer_size']}"
+            f"_m{hy_params['der_replay_batch_size']}_alpha{float(hy_params['der_alpha']):g}_stat.csv"
+        )
+    elif method == 'DER_cor':
+        name = (
+            f"sgd_DER_cor_lr{sgd_lr:g}_M{hy_params['der_buffer_size']}"
+            f"_m{hy_params['der_replay_batch_size']}_alpha{float(hy_params['der_alpha']):g}"
+            f"_eta{float(hy_params['sgd_eta']):g}_gm{float(hy_params['sgd_gamma']):g}_stat.csv"
+        )
+    else:
+        name = (
+            f"sgd_DER++_lr{sgd_lr:g}_M{hy_params['der_buffer_size']}"
+            f"_m{hy_params['der_replay_batch_size']}_alpha{float(hy_params['der_alpha']):g}"
+            f"_beta{float(hy_params['der_beta']):g}_stat.csv"
+        )
+    path = os.path.join(root, name)
+    df = pd.DataFrame({
+        'task_step': list(steps),
+        'train_mean': tr_m,
+        'train_std': tr_s,
+        'test_mean': te_m,
+        'test_std': te_s,
+        'sgd_lr': sgd_lr,
+        'method': method,
+    })
+    df.to_csv(path, index=False)
+    print(f"Saved {path}")
+
 if __name__ == "__main__":
     hy_params_vanilla = {
         'device': torch.device("cuda" if torch.cuda.is_available() else "cpu"),
@@ -369,8 +452,14 @@ if __name__ == "__main__":
     Begin = time.time()
     print("device:", hy_params_vanilla['device'])
     parser = argparse.ArgumentParser(description='Parallel Hyperparameter Sweep')
-    parser.add_argument('--label_correction', type=str, default='none', choices=['none', 'cumulative', 'sgd_ewc', 'cor'],
-                        help='none: vanilla task-only; cumulative: cumulative replay on all data seen so far; sgd_ewc: vanilla + EWC; cor: label correction')
+    parser.add_argument('--label_correction', type=str, default='none',
+                        choices=['none', 'cumulative', 'sgd_ewc', 'cor', 'label_smooth', 'ER', 'DER', 'DER++', 'DER_cor'],
+                        help='none: vanilla; cumulative: cumulative replay; sgd_ewc: EWC; cor: target correction; label_smooth / ER / DER / DER++: replay and soft-label baselines')
+    parser.add_argument('--label_smoothing_epsilon', type=float, default=0.1)
+    parser.add_argument('--der_buffer_size', type=int, default=600)
+    parser.add_argument('--der_replay_batch_size', type=int, default=4)
+    parser.add_argument('--der_alpha', type=float, default=1.0)
+    parser.add_argument('--der_beta', type=float, default=1.0)
     parser.add_argument('--sgd_eta', type=float, default=0.003, help='Learning rate / Eta (label correction path)')
     parser.add_argument('--sgd_gamma', type=float, default=100, help='Gamma (label correction path)')
     parser.add_argument('--sgd_lr', type=float, default=0.01, help='SGD lr (vanilla / cumulative; or fallback if sgd_lr_fixed omitted)')
@@ -445,6 +534,19 @@ if __name__ == "__main__":
     elif args.label_correction == 'cumulative':
         steps, tr_m, tr_s, te_m, te_s = core50_van_sgd_one_param_cumulative(sgd_lr=args.sgd_lr, hy_params_vanilla=hy_params_vanilla)
         save_van_sgd_to_csv(steps=steps, tr_m=tr_m, tr_s=tr_s, te_m=te_m, te_s=te_s, lr=args.sgd_lr, seeds=args.ikmax, cum_replay=True)
+    elif args.label_correction in ('label_smooth', 'ER', 'DER', 'DER++', 'DER_cor'):
+        hp = hy_params_vanilla.copy()
+        hp['label_smoothing_epsilon'] = args.label_smoothing_epsilon
+        hp['der_buffer_size'] = args.der_buffer_size
+        hp['der_replay_batch_size'] = args.der_replay_batch_size
+        hp['der_alpha'] = args.der_alpha
+        hp['sgd_eta'] = args.sgd_eta
+        hp['sgd_gamma'] = args.sgd_gamma
+        hp['online_cor_type'] = args.online_cor_type if args.online_cor_type in ('iter', 'full', 'batch_gpu') else 'batch_gpu'
+        if args.label_correction == 'DER++':
+            hp['der_beta'] = args.der_beta
+        steps, tr_m, tr_s, te_m, te_s = core50_replay_one_param(args.sgd_lr, hp, args.label_correction)
+        save_core50_replay_csv(steps, tr_m, tr_s, te_m, te_s, args.sgd_lr, hp, args.label_correction)
     elif args.label_correction == 'sgd_ewc':
         hp = hy_params_vanilla.copy()
         if args.ewc_lambda is not None:

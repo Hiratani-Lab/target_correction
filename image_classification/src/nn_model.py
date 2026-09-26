@@ -2699,3 +2699,1236 @@ def full_efficient_train_core50_label_correction_adap_kernel(
             print(f"Task {task_id + 1} | Full Train Acc: {tr_acc*100:.2f}% | Full Test Acc: {te_acc*100:.2f}%")
 
     return np.array(train_accs), np.array(test_accs)
+
+def sgd_train_streaming_label_smooth(
+        model, X_train, y_train, X_test, y_test, Niters, hy_params,
+        epsilon, gate_mode="none"):
+    if hy_params['criterion'] != 'mse':
+        raise ValueError("label_smooth currently supports criterion='mse' only")
+    if gate_mode != "none":
+        raise ValueError("label_smooth currently supports gate_mode='none' only")
+    epsilon = float(epsilon)
+    if not 0.0 <= epsilon <= 1.0:
+        raise ValueError(f"label smoothing epsilon must lie in [0, 1], got {epsilon}")
+
+    device = torch.device(hy_params["device"])
+    model = model.to(device)
+    opt = optimizer(hy_params, model)
+    num_outputs = 2 if hy_params['train_order_type'] == 'task_incremental' else 10
+    Y_train_oh = one_hot(y_train, num_outputs)
+    Y_train_smooth = (
+        (1.0 - epsilon) * Y_train_oh
+        + epsilon / num_outputs
+    )
+    dN = Niters[1] - Niters[0]
+    train_accs, test_accs = [], []
+    train_mses, test_mses = [], []
+    print(
+        f"label_smooth: epsilon={epsilon:g}, lr={hy_params['sgd_lr']:g}, "
+        f"num_outputs={num_outputs}"
+    )
+
+    for N in Niters:
+        model.train()
+        Xb = torch.as_tensor(
+            X_train[N - dN:N], device=device, dtype=torch.float32)
+        Yb_smooth = torch.as_tensor(
+            Y_train_smooth[N - dN:N], device=device, dtype=Xb.dtype)
+
+        for start in range(0, Xb.shape[0], hy_params['sgd_batch_size']):
+            end = min(start + hy_params['sgd_batch_size'], Xb.shape[0])
+            x_mb = Xb[start:end]
+            y_mb_smooth = Yb_smooth[start:end]
+            logits = model(x_mb)
+            loss = mse_loss(logits, y_mb_smooth)
+            if torch.isnan(loss) or torch.isinf(loss):
+                raise FloatingPointError(
+                    f"NaN/Inf label-smoothing loss detected at step {N}")
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+
+        model.eval()
+        tr_acc, tr_mse = accuracy_cnn(
+            model, X_train[:N], y_train[:N],
+            device=device, gate_mode="none", true_gate_ids=None,
+        )
+        if hy_params['train_order_type'] == 'class_incremental':
+            X_test_eval, y_test_eval = incre_seen_test_subset(
+                y_train[:N], X_test, y_test)
+        else:
+            X_test_eval, y_test_eval = X_test, y_test
+        te_acc, te_mse = accuracy_cnn(
+            model, X_test_eval, y_test_eval,
+            device=device, gate_mode="none", true_gate_ids=None,
+        )
+        train_accs.append(tr_acc)
+        test_accs.append(te_acc)
+        train_mses.append(tr_mse)
+        test_mses.append(te_mse)
+
+    return (
+        np.array(train_accs), np.array(test_accs),
+        np.array(train_mses), np.array(test_mses),
+    )
+
+
+def sgd_train_streaming_er(model, X_train, y_train, X_test, y_test, Niters, hy_params, gate_mode="none"):
+    if hy_params['criterion'] != 'mse':
+        raise ValueError("ER currently supports criterion='mse' only")
+    if gate_mode != "none":
+        raise ValueError("ER baseline currently supports gate_mode='none' only")
+
+    device = torch.device(hy_params["device"])
+    model = model.to(device)
+    model.train()
+    opt = optimizer(hy_params, model)
+
+    buffer_capacity = int(hy_params['der_buffer_size'])
+    replay_batch_size = int(hy_params['der_replay_batch_size'])
+    er_alpha = float(hy_params['der_alpha'])
+    if buffer_capacity <= 0:
+        raise ValueError("der_buffer_size must be positive")
+    if replay_batch_size <= 0:
+        raise ValueError("der_replay_batch_size must be positive")
+    if er_alpha < 0:
+        raise ValueError("der_alpha must be non-negative")
+
+    num_outputs = 2 if hy_params['train_order_type'] == 'task_incremental' else 10
+    Y_train_oh = one_hot(y_train, num_outputs)
+    dN = Niters[1] - Niters[0]
+
+    sample_shape = tuple(X_train.shape[1:])
+    buffer_x = torch.empty((buffer_capacity, *sample_shape), device=device, dtype=torch.float32)
+    buffer_y = torch.empty((buffer_capacity, num_outputs), device=device, dtype=torch.float32)
+    buffer_count = 0
+    seen_count = 0
+
+    train_accs, test_accs = [], []
+    train_mses, test_mses = [], []
+    print(
+        f"ER: buffer_size={buffer_capacity}, replay_batch_size={replay_batch_size}, "
+        f"alpha={er_alpha:g}"
+    )
+
+    for N in Niters:
+        model.train()
+        Xb = torch.as_tensor(X_train[N - dN:N], device=device, dtype=torch.float32)
+        Yb_oh = torch.as_tensor(Y_train_oh[N - dN:N], device=device, dtype=Xb.dtype)
+
+        for start in range(0, Xb.shape[0], hy_params['sgd_batch_size']):
+            end = min(start + hy_params['sgd_batch_size'], Xb.shape[0])
+            x_mb = Xb[start:end]
+            y_mb = Yb_oh[start:end]
+
+            logits = model(x_mb)
+            loss_current = mse_loss(logits, y_mb)
+
+            if buffer_count > 0:
+                replay_size = min(replay_batch_size, buffer_count)
+                replay_idx = torch.randperm(buffer_count, device=device)[:replay_size]
+                replay_logits = model(buffer_x[replay_idx])
+                loss_replay = mse_loss(replay_logits, buffer_y[replay_idx])
+                loss = loss_current + er_alpha * loss_replay
+            else:
+                loss = loss_current
+
+            if torch.isnan(loss) or torch.isinf(loss):
+                raise FloatingPointError(f"NaN/Inf ER loss detected at step {N}")
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+
+            with torch.no_grad():
+                for row in range(x_mb.shape[0]):
+                    if seen_count < buffer_capacity:
+                        slot = seen_count
+                        buffer_count += 1
+                    else:
+                        candidate = np.random.randint(0, seen_count + 1)
+                        slot = candidate if candidate < buffer_capacity else None
+                    if slot is not None:
+                        buffer_x[slot].copy_(x_mb[row])
+                        buffer_y[slot].copy_(y_mb[row])
+                    seen_count += 1
+
+        model.eval()
+        tr_acc, tr_mse = accuracy_cnn(
+            model, X_train[:N], y_train[:N],
+            device=device, gate_mode="none", true_gate_ids=None,
+        )
+        if hy_params['train_order_type'] == 'class_incremental':
+            X_test_eval, y_test_eval = incre_seen_test_subset(y_train[:N], X_test, y_test)
+        else:
+            X_test_eval, y_test_eval = X_test, y_test
+        te_acc, te_mse = accuracy_cnn(
+            model, X_test_eval, y_test_eval,
+            device=device, gate_mode="none", true_gate_ids=None,
+        )
+
+        train_accs.append(tr_acc)
+        test_accs.append(te_acc)
+        train_mses.append(tr_mse)
+        test_mses.append(te_mse)
+
+    return (
+        np.array(train_accs), np.array(test_accs),
+        np.array(train_mses), np.array(test_mses),
+    )
+
+
+def sgd_train_streaming_der(model, X_train, y_train, X_test, y_test, Niters, hy_params, gate_mode="none"):
+    if hy_params['criterion'] != 'mse':
+        raise ValueError("DER currently supports criterion='mse' only")
+    if gate_mode != "none":
+        raise ValueError("DER baseline currently supports gate_mode='none' only")
+
+    device = torch.device(hy_params["device"])
+    model = model.to(device)
+    model.train()
+    opt = optimizer(hy_params, model)
+
+    buffer_capacity = int(hy_params['der_buffer_size'])
+    replay_batch_size = int(hy_params['der_replay_batch_size'])
+    der_alpha = float(hy_params['der_alpha'])
+    der_beta = hy_params.get('der_beta', None)
+    if der_beta is not None:
+        der_beta = float(der_beta)
+    if buffer_capacity <= 0:
+        raise ValueError("der_buffer_size must be positive")
+    if replay_batch_size <= 0:
+        raise ValueError("der_replay_batch_size must be positive")
+    if der_alpha < 0:
+        raise ValueError("der_alpha must be non-negative")
+    if der_beta is not None and der_beta < 0:
+        raise ValueError("der_beta must be non-negative")
+
+    num_outputs = 2 if hy_params['train_order_type'] == 'task_incremental' else 10
+    Y_train_oh = one_hot(y_train, num_outputs)
+    dN = Niters[1] - Niters[0]
+
+    sample_shape = tuple(X_train.shape[1:])
+    buffer_x = torch.empty((buffer_capacity, *sample_shape), device=device, dtype=torch.float32)
+    buffer_z = torch.empty((buffer_capacity, num_outputs), device=device, dtype=torch.float32)
+    buffer_y = (
+        torch.empty((buffer_capacity, num_outputs), device=device, dtype=torch.float32)
+        if der_beta is not None else None
+    )
+    buffer_count = 0
+    seen_count = 0
+
+    train_accs, test_accs = [], []
+    train_mses, test_mses = [], []
+    method_name = "DER++" if der_beta is not None else "DER"
+    beta_description = f", beta={der_beta:g}" if der_beta is not None else ""
+    print(
+        f"{method_name}: buffer_size={buffer_capacity}, replay_batch_size={replay_batch_size}, "
+        f"alpha={der_alpha:g}{beta_description}"
+    )
+
+    for N in Niters:
+        model.train()
+        Xb = torch.as_tensor(X_train[N - dN:N], device=device, dtype=torch.float32)
+        Yb_oh = torch.as_tensor(Y_train_oh[N - dN:N], device=device, dtype=Xb.dtype)
+
+        for start in range(0, Xb.shape[0], hy_params['sgd_batch_size']):
+            end = min(start + hy_params['sgd_batch_size'], Xb.shape[0])
+            x_mb = Xb[start:end]
+            y_mb = Yb_oh[start:end]
+
+            logits = model(x_mb)
+            stored_logits = logits.detach().clone()
+            loss_current = mse_loss(logits, y_mb)
+
+            if buffer_count > 0:
+                replay_size = min(replay_batch_size, buffer_count)
+                replay_idx = torch.randperm(buffer_count, device=device)[:replay_size]
+                replay_logits = model(buffer_x[replay_idx])
+                loss_replay = mse_loss(replay_logits, buffer_z[replay_idx])
+                loss = loss_current + der_alpha * loss_replay
+                if der_beta is not None:
+                    loss_replay_label = mse_loss(replay_logits, buffer_y[replay_idx])
+                    loss = loss + der_beta * loss_replay_label
+            else:
+                loss_replay = None
+                loss = loss_current
+
+            if torch.isnan(loss) or torch.isinf(loss):
+                raise FloatingPointError(f"NaN/Inf DER loss detected at step {N}")
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+
+            with torch.no_grad():
+                for row in range(x_mb.shape[0]):
+                    if seen_count < buffer_capacity:
+                        slot = seen_count
+                        buffer_count += 1
+                    else:
+                        candidate = np.random.randint(0, seen_count + 1)
+                        slot = candidate if candidate < buffer_capacity else None
+                    if slot is not None:
+                        buffer_x[slot].copy_(x_mb[row])
+                        buffer_z[slot].copy_(stored_logits[row])
+                        if buffer_y is not None:
+                            buffer_y[slot].copy_(y_mb[row])
+                    seen_count += 1
+
+        model.eval()
+        tr_acc, tr_mse = accuracy_cnn(
+            model, X_train[:N], y_train[:N],
+            device=device, gate_mode="none", true_gate_ids=None,
+        )
+        if hy_params['train_order_type'] == 'class_incremental':
+            X_test_eval, y_test_eval = incre_seen_test_subset(y_train[:N], X_test, y_test)
+        else:
+            X_test_eval, y_test_eval = X_test, y_test
+        te_acc, te_mse = accuracy_cnn(
+            model, X_test_eval, y_test_eval,
+            device=device, gate_mode="none", true_gate_ids=None,
+        )
+
+        train_accs.append(tr_acc)
+        test_accs.append(te_acc)
+        train_mses.append(tr_mse)
+        test_mses.append(te_mse)
+
+    return (
+        np.array(train_accs), np.array(test_accs),
+        np.array(train_mses), np.array(test_mses),
+    )
+
+
+CORE50_NC_TASK_CLASSES = [10, 5, 5, 5, 5, 5, 5, 5, 5]
+
+
+def _core50_eval_full(model, X_train, y_train, X_test, y_test, device):
+    model.eval()
+    with torch.no_grad():
+        tr_acc, tr_mse = accuracy_cnn(
+            model, X_train, y_train, device=device,
+            gate_mode="none", true_gate_ids=None,
+        )
+        te_acc, te_mse = accuracy_cnn(
+            model, X_test, y_test, device=device,
+            gate_mode="none", true_gate_ids=None,
+        )
+    return tr_acc, te_acc, tr_mse, te_mse
+
+
+def _unique_reservoir_slot(seen_mask, orig_idx, seen_count, buffer_count, buffer_capacity):
+    if seen_mask[orig_idx]:
+        return None, seen_count, buffer_count
+    seen_mask[orig_idx] = True
+    if seen_count < buffer_capacity:
+        slot = seen_count
+        buffer_count += 1
+    else:
+        candidate = np.random.randint(0, seen_count + 1)
+        slot = candidate if candidate < buffer_capacity else None
+    return slot, seen_count + 1, buffer_count
+
+
+def train_core50_label_smooth(
+        model, X_train, y_train, X_test, y_test,
+        hy_params, num_epochs, batch_size,
+        num_tr_per_class, total_classes=50):
+    if hy_params['criterion'] != 'mse':
+        raise ValueError("label_smooth currently supports criterion='mse' only")
+    epsilon = float(hy_params['label_smoothing_epsilon'])
+    if not 0.0 <= epsilon <= 1.0:
+        raise ValueError(f"label smoothing epsilon must lie in [0, 1], got {epsilon}")
+
+    device = hy_params['device']
+    task_classes = CORE50_NC_TASK_CLASSES
+    train_accs, test_accs, train_mses, test_mses = [], [], [], []
+    seen_train_samples = 0
+    opt = optimizer(hy_params, model)
+    print(
+        f"label_smooth: epsilon={epsilon:g}, lr={hy_params['sgd_lr']:g}, "
+        f"num_outputs={total_classes}"
+    )
+
+    for task_id, num_classes_in_task in enumerate(task_classes):
+        print(
+            f"--- Starting Task {task_id + 1}/{len(task_classes)} "
+            f"({num_classes_in_task} classes, label_smooth) ---"
+        )
+        task_train_samples = num_classes_in_task * num_tr_per_class
+        start_tr = seen_train_samples
+        end_tr = seen_train_samples + task_train_samples
+        X_task = X_train[start_tr:end_tr]
+        y_task = y_train[start_tr:end_tr]
+        seen_train_samples += task_train_samples
+
+        model.train()
+        for epoch in range(num_epochs):
+            permutation = torch.randperm(X_task.shape[0])
+            for i in range(0, X_task.shape[0], batch_size):
+                indices = permutation[i:i + batch_size]
+                x_mb = torch.as_tensor(X_task[indices], dtype=torch.float32, device=device)
+                y_mb_target = torch.as_tensor(y_task[indices], dtype=torch.int64, device=device)
+                y_mb = F.one_hot(y_mb_target, num_classes=total_classes).float()
+                y_mb_smooth = (1.0 - epsilon) * y_mb + epsilon / total_classes
+
+                opt.zero_grad(set_to_none=True)
+                logits = model(x_mb)
+                loss_cls = mse_loss(logits, y_mb_smooth)
+                if torch.isnan(loss_cls) or torch.isinf(loss_cls):
+                    raise FloatingPointError(
+                        f"NaN/Inf label-smoothing loss at task {task_id + 1}, epoch {epoch}"
+                    )
+                loss_cls.backward()
+                opt.step()
+
+        tr_acc, te_acc, tr_mse, te_mse = _core50_eval_full(
+            model, X_train, y_train, X_test, y_test, device)
+        train_accs.append(tr_acc)
+        test_accs.append(te_acc)
+        train_mses.append(tr_mse)
+        test_mses.append(te_mse)
+        print(
+            f"Task {task_id + 1} | Full Train Acc: {tr_acc*100:.2f}% | "
+            f"Full Test Acc: {te_acc*100:.2f}%"
+        )
+
+    return (
+        np.array(train_accs), np.array(test_accs),
+        np.array(train_mses), np.array(test_mses),
+    )
+
+
+def train_core50_er(
+        model, X_train, y_train, X_test, y_test,
+        hy_params, num_epochs, batch_size,
+        num_tr_per_class, total_classes=50):
+    if hy_params['criterion'] != 'mse':
+        raise ValueError("ER currently supports criterion='mse' only")
+
+    device = hy_params['device']
+    buffer_capacity = int(hy_params['der_buffer_size'])
+    replay_batch_size = int(hy_params['der_replay_batch_size'])
+    er_alpha = float(hy_params['der_alpha'])
+    if buffer_capacity <= 0 or replay_batch_size <= 0:
+        raise ValueError("der_buffer_size and der_replay_batch_size must be positive")
+    if er_alpha < 0:
+        raise ValueError("der_alpha must be non-negative")
+
+    n_train = int(len(y_train))
+    sample_shape = tuple(torch.as_tensor(X_train[0]).shape)
+    buffer_x = torch.empty(
+        (buffer_capacity, *sample_shape), device=device, dtype=torch.float32)
+    buffer_y = torch.empty(
+        (buffer_capacity, total_classes), device=device, dtype=torch.float32)
+    buffer_count = 0
+    seen_count = 0
+    seen_mask = np.zeros(n_train, dtype=bool)
+
+    train_accs, test_accs, train_mses, test_mses = [], [], [], []
+    seen_train_samples = 0
+    opt = optimizer(hy_params, model)
+    print(
+        f"ER: buffer_size={buffer_capacity}, replay_batch_size={replay_batch_size}, "
+        f"alpha={er_alpha:g}"
+    )
+
+    for task_id, num_classes_in_task in enumerate(CORE50_NC_TASK_CLASSES):
+        print(
+            f"--- Starting Task {task_id + 1}/{len(CORE50_NC_TASK_CLASSES)} "
+            f"({num_classes_in_task} classes, ER) ---"
+        )
+        task_train_samples = num_classes_in_task * num_tr_per_class
+        start_tr = seen_train_samples
+        end_tr = seen_train_samples + task_train_samples
+        X_task = X_train[start_tr:end_tr]
+        y_task = y_train[start_tr:end_tr]
+        seen_train_samples += task_train_samples
+
+        model.train()
+        for epoch in range(num_epochs):
+            permutation = torch.randperm(X_task.shape[0])
+            for i in range(0, X_task.shape[0], batch_size):
+                indices = permutation[i:i + batch_size]
+                x_mb = torch.as_tensor(X_task[indices], dtype=torch.float32, device=device)
+                y_mb_target = torch.as_tensor(y_task[indices], dtype=torch.int64, device=device)
+                y_mb = F.one_hot(y_mb_target, num_classes=total_classes).float()
+
+                logits = model(x_mb)
+                loss_current = mse_loss(logits, y_mb)
+                if buffer_count > 0:
+                    replay_size = min(replay_batch_size, buffer_count)
+                    replay_idx = torch.randperm(buffer_count, device=device)[:replay_size]
+                    replay_logits = model(buffer_x[replay_idx])
+                    loss_replay = mse_loss(replay_logits, buffer_y[replay_idx])
+                    loss = loss_current + er_alpha * loss_replay
+                else:
+                    loss = loss_current
+
+                if torch.isnan(loss) or torch.isinf(loss):
+                    raise FloatingPointError(
+                        f"NaN/Inf ER loss at task {task_id + 1}, epoch {epoch}"
+                    )
+                opt.zero_grad(set_to_none=True)
+                loss.backward()
+                opt.step()
+
+                with torch.no_grad():
+                    for row, local_idx in enumerate(indices.tolist()):
+                        orig_idx = start_tr + int(local_idx)
+                        slot, seen_count, buffer_count = _unique_reservoir_slot(
+                            seen_mask, orig_idx, seen_count, buffer_count, buffer_capacity)
+                        if slot is not None:
+                            buffer_x[slot].copy_(x_mb[row])
+                            buffer_y[slot].copy_(y_mb[row])
+
+        tr_acc, te_acc, tr_mse, te_mse = _core50_eval_full(
+            model, X_train, y_train, X_test, y_test, device)
+        train_accs.append(tr_acc)
+        test_accs.append(te_acc)
+        train_mses.append(tr_mse)
+        test_mses.append(te_mse)
+        print(
+            f"Task {task_id + 1} | Full Train Acc: {tr_acc*100:.2f}% | "
+            f"Full Test Acc: {te_acc*100:.2f}% | "
+            f"buffer {buffer_count}/{buffer_capacity}, unique_seen={seen_count}"
+        )
+
+    return (
+        np.array(train_accs), np.array(test_accs),
+        np.array(train_mses), np.array(test_mses),
+    )
+
+
+def train_core50_der(
+        model, X_train, y_train, X_test, y_test,
+        hy_params, num_epochs, batch_size,
+        num_tr_per_class, total_classes=50):
+    if hy_params['criterion'] != 'mse':
+        raise ValueError("DER currently supports criterion='mse' only")
+
+    device = hy_params['device']
+    buffer_capacity = int(hy_params['der_buffer_size'])
+    replay_batch_size = int(hy_params['der_replay_batch_size'])
+    der_alpha = float(hy_params['der_alpha'])
+    der_beta = hy_params.get('der_beta', None)
+    if der_beta is not None:
+        der_beta = float(der_beta)
+    if buffer_capacity <= 0 or replay_batch_size <= 0:
+        raise ValueError("der_buffer_size and der_replay_batch_size must be positive")
+    if der_alpha < 0:
+        raise ValueError("der_alpha must be non-negative")
+    if der_beta is not None and der_beta < 0:
+        raise ValueError("der_beta must be non-negative")
+
+    n_train = int(len(y_train))
+    sample_shape = tuple(torch.as_tensor(X_train[0]).shape)
+    buffer_x = torch.empty(
+        (buffer_capacity, *sample_shape), device=device, dtype=torch.float32)
+    buffer_z = torch.empty(
+        (buffer_capacity, total_classes), device=device, dtype=torch.float32)
+    buffer_y = (
+        torch.empty((buffer_capacity, total_classes), device=device, dtype=torch.float32)
+        if der_beta is not None else None
+    )
+    buffer_count = 0
+    seen_count = 0
+    seen_mask = np.zeros(n_train, dtype=bool)
+    refresh_logits = bool(hy_params.get('der_refresh_logits', False))
+    slot_of = np.full(n_train, -1, dtype=np.int64)
+    buffer_orig = np.full(buffer_capacity, -1, dtype=np.int64)
+
+    train_accs, test_accs, train_mses, test_mses = [], [], [], []
+    seen_train_samples = 0
+    opt = optimizer(hy_params, model)
+    method_name = "DER++" if der_beta is not None else "DER"
+    beta_description = f", beta={der_beta:g}" if der_beta is not None else ""
+    refresh_description = ", refresh_logits=epoch" if refresh_logits else ""
+    print(
+        f"{method_name}: buffer_size={buffer_capacity}, "
+        f"replay_batch_size={replay_batch_size}, "
+        f"alpha={der_alpha:g}{beta_description}{refresh_description}"
+    )
+
+    for task_id, num_classes_in_task in enumerate(CORE50_NC_TASK_CLASSES):
+        print(
+            f"--- Starting Task {task_id + 1}/{len(CORE50_NC_TASK_CLASSES)} "
+            f"({num_classes_in_task} classes, {method_name}) ---"
+        )
+        task_train_samples = num_classes_in_task * num_tr_per_class
+        start_tr = seen_train_samples
+        end_tr = seen_train_samples + task_train_samples
+        X_task = X_train[start_tr:end_tr]
+        y_task = y_train[start_tr:end_tr]
+        seen_train_samples += task_train_samples
+
+        model.train()
+        for epoch in range(num_epochs):
+            permutation = torch.randperm(X_task.shape[0])
+            for i in range(0, X_task.shape[0], batch_size):
+                indices = permutation[i:i + batch_size]
+                x_mb = torch.as_tensor(X_task[indices], dtype=torch.float32, device=device)
+                y_mb_target = torch.as_tensor(y_task[indices], dtype=torch.int64, device=device)
+                y_mb = F.one_hot(y_mb_target, num_classes=total_classes).float()
+
+                logits = model(x_mb)
+                stored_logits = logits.detach().clone()
+                loss_current = mse_loss(logits, y_mb)
+                if buffer_count > 0:
+                    replay_size = min(replay_batch_size, buffer_count)
+                    replay_idx = torch.randperm(buffer_count, device=device)[:replay_size]
+                    replay_logits = model(buffer_x[replay_idx])
+                    loss_replay = mse_loss(replay_logits, buffer_z[replay_idx])
+                    loss = loss_current + der_alpha * loss_replay
+                    if der_beta is not None:
+                        loss_replay_label = mse_loss(replay_logits, buffer_y[replay_idx])
+                        loss = loss + der_beta * loss_replay_label
+                else:
+                    loss = loss_current
+
+                if torch.isnan(loss) or torch.isinf(loss):
+                    raise FloatingPointError(
+                        f"NaN/Inf {method_name} loss at task {task_id + 1}, epoch {epoch}"
+                    )
+                opt.zero_grad(set_to_none=True)
+                loss.backward()
+                opt.step()
+
+                with torch.no_grad():
+                    logit_target = model(x_mb).detach() if refresh_logits else stored_logits
+                    for row, local_idx in enumerate(indices.tolist()):
+                        orig_idx = start_tr + int(local_idx)
+                        held_slot = int(slot_of[orig_idx]) if refresh_logits else -1
+                        if held_slot >= 0:
+                            buffer_z[held_slot].copy_(logit_target[row])
+                            continue
+                        slot, seen_count, buffer_count = _unique_reservoir_slot(
+                            seen_mask, orig_idx, seen_count, buffer_count, buffer_capacity)
+                        if slot is not None:
+                            old_orig = int(buffer_orig[slot])
+                            if old_orig >= 0:
+                                slot_of[old_orig] = -1
+                            slot_of[orig_idx] = int(slot)
+                            buffer_orig[slot] = orig_idx
+                            buffer_x[slot].copy_(x_mb[row])
+                            buffer_z[slot].copy_(logit_target[row])
+                            if buffer_y is not None:
+                                buffer_y[slot].copy_(y_mb[row])
+
+        tr_acc, te_acc, tr_mse, te_mse = _core50_eval_full(
+            model, X_train, y_train, X_test, y_test, device)
+        train_accs.append(tr_acc)
+        test_accs.append(te_acc)
+        train_mses.append(tr_mse)
+        test_mses.append(te_mse)
+        print(
+            f"Task {task_id + 1} | Full Train Acc: {tr_acc*100:.2f}% | "
+            f"Full Test Acc: {te_acc*100:.2f}% | "
+            f"buffer {buffer_count}/{buffer_capacity}, unique_seen={seen_count}"
+        )
+
+    return (
+        np.array(train_accs), np.array(test_accs),
+        np.array(train_mses), np.array(test_mses),
+    )
+
+def select_correction_anchor_indices(seen_upto, task_size, cor_tr_percent):
+    if task_size <= 0 or seen_upto <= 0 or cor_tr_percent <= 0:
+        return np.arange(0, 0, dtype=np.int64)
+    n_tasks_touched = int(np.ceil(seen_upto / task_size))
+    idx_chunks = []
+    for j in range(n_tasks_touched):
+        task_start = j * task_size
+        seen_in_task = min(task_start + task_size, seen_upto) - task_start
+        if cor_tr_percent >= 1.0:
+            k = seen_in_task
+        else:
+            k = min(seen_in_task, int(round(task_size * cor_tr_percent)))
+        if k > 0:
+            idx_chunks.append(np.arange(task_start, task_start + k))
+    if not idx_chunks:
+        return np.arange(0, 0, dtype=np.int64)
+    return np.concatenate(idx_chunks)
+
+
+def _pairwise_empirical_ntk(kernel_model, X1, X2, hy_params):
+    rescale = hy_params['kernel_tp'] != 'jacobian_empirical_no_rescale'
+    return empirical_ntk_blocks(
+        kernel_model, X1, X2,
+        ntk_empirical_rescale=rescale, hy_params=hy_params)
+
+
+def _correct_targets_against_memory(
+        K_all, Y_mem, Y_new, gamma, eta, z_type, mini_bz, device, eps=1e-12,
+        Z_mem=None):
+    Y_new = np.asarray(Y_new, dtype=np.float64)
+    m = int(Y_new.shape[0])
+    if m == 0:
+        return Y_new
+    M = 0 if Y_mem is None else int(np.asarray(Y_mem).shape[0])
+    if M == 0:
+        return Y_new.copy()
+    if Z_mem is None:
+        Z_mem = Y_mem
+
+    K = torch.as_tensor(K_all, dtype=torch.float64, device=device)
+    Y_prev = torch.as_tensor(Y_mem, dtype=torch.float64, device=device)
+    Z_prev = torch.as_tensor(Z_mem, dtype=torch.float64, device=device)
+    Y_m = torch.as_tensor(Y_new, dtype=torch.float64, device=device)
+    K_prev = K[:M, :M]
+    K_cross = K[:M, M:M + m]
+    K_m = K[M:M + m, M:M + m]
+    jitter = 1e-6
+
+    def _solve_or_lstsq(A, B, name):
+        try:
+            return torch.linalg.solve(A, B)
+        except torch._C._LinAlgError:
+            print(f"lstsq in cal {name}")
+            A_stab = A + jitter * torch.eye(A.shape[0], dtype=torch.float64, device=device)
+            return torch.linalg.lstsq(A_stab, B).solution
+
+    A_kr = K_prev.clone()
+    A_kr.diagonal().add_(gamma)
+    V_kr = _solve_or_lstsq(A_kr, K_cross, "V_kr")
+    f_kr_m = V_kr.T @ Y_prev
+    Q_m = K_cross.T @ V_kr
+
+    A_on = KbU_mini_batch(K_prev, mini_bz)
+    A_on.diagonal().add_(1.0 / eta)
+    V_on = _solve_or_lstsq(A_on, K_cross, "V_on")
+    f_on_m = V_on.T @ Z_prev
+
+    K_m_U = KbU_mini_batch(K_m, mini_bz)
+    H_right = (1.0 / eta) * torch.eye(m, dtype=torch.float64, device=device) + K_m_U
+    stable_K_m = K_m + eps * torch.eye(m, dtype=torch.float64, device=device)
+    H = _solve_or_lstsq(stable_K_m, H_right, "H")
+    P_m_inv = gamma * torch.eye(m, dtype=torch.float64, device=device) + K_m - Q_m
+    I_m = torch.eye(m, dtype=torch.float64, device=device)
+    P_m = _solve_or_lstsq(P_m_inv, I_m, "P_m")
+    M_on = H.T - I_m
+    M_off = gamma * (H.T @ P_m)
+
+    if z_type == 'online':
+        Z_m = Y_m + M_on @ (Y_m - f_on_m)
+    elif z_type == 'offline':
+        Z_m = Y_m + M_off @ (f_kr_m - Y_m)
+    else:
+        Z_m = Y_m + M_on @ (Y_m - f_on_m) + M_off @ (f_kr_m - Y_m)
+    return Z_m.detach().cpu().numpy()
+
+
+def sgd_train_streaming_reservoir_tc(
+        model, X_train, y_train, X_test, y_test, Niters, hy_params,
+        sgd_on_gm, sgd_on_eta, mode='tc', gate_mode='none'):
+    mode = str(mode)
+    if mode not in ('tc', 'der_cor'):
+        raise ValueError(f"mode must be 'tc' or 'der_cor', got {mode!r}")
+    if hy_params['criterion'] != 'mse':
+        raise ValueError(f"{mode} currently supports criterion='mse' only")
+    if gate_mode != 'none':
+        raise ValueError(f"{mode} currently supports gate_mode='none' only")
+    if hy_params.get('train_order_type') != 'task_incremental':
+        raise ValueError(f"{mode} frozen-kernel schedule requires task_incremental")
+
+    use_replay = mode == 'der_cor'
+    device = hy_params['device']
+    n_train = int(len(y_train))
+    on_cor_bs = max(int(hy_params.get('on_cor_bs', 20)), 1)
+    batch_size = int(hy_params['sgd_batch_size'])
+    z_type = hy_params.get('z_type', 'both')
+    z_mini_bz = int(hy_params.get('z_mini_bz', 1))
+    num_outputs = 2 if hy_params['train_order_type'] == 'task_incremental' else 10
+    Y_train_oh = one_hot(y_train, num_outputs)
+    niters = [int(n) for n in Niters]
+    if len(niters) > 1:
+        record_step = int(niters[1] - niters[0])
+    else:
+        record_step = int(hy_params['record_step'])
+    niters_set = set(niters)
+
+    total_tasks = int(getattr(model, 'num_tasks', 5))
+    if n_train % total_tasks != 0:
+        raise ValueError(
+            f"Ntrain={n_train} is not divisible by total_tasks={total_tasks}")
+    samples_per_task = n_train // total_tasks
+
+    if use_replay:
+        buffer_capacity = int(hy_params['der_buffer_size'])
+        replay_batch_size = int(hy_params['der_replay_batch_size'])
+        der_alpha = float(hy_params['der_alpha'])
+        der_beta = hy_params.get('der_beta', None)
+        if der_beta is not None:
+            der_beta = float(der_beta)
+        if buffer_capacity <= 0 or replay_batch_size <= 0:
+            raise ValueError("der_buffer_size and der_replay_batch_size must be positive")
+        if der_alpha < 0 or (der_beta is not None and der_beta < 0):
+            raise ValueError("DER alpha and beta must be non-negative")
+        hy_params_opt = hy_params
+    else:
+        cor_tr_percent = float(hy_params.get('cor_tr_percent', 1.0))
+        buffer_capacity = max(1, int(round(n_train * max(cor_tr_percent, 0.0))))
+        if cor_tr_percent <= 0:
+            buffer_capacity = 1
+        replay_batch_size = 0
+        der_alpha = 0.0
+        der_beta = None
+        hy_params_opt = hy_params
+
+    model = model.to(device)
+    opt = optimizer(hy_params_opt, model)
+    method_name = "TC" if not use_replay else (
+        "DER++_cor" if der_beta is not None else "DER_cor")
+    sample_shape = tuple(torch.as_tensor(X_train[0]).shape)
+    buffer_x = torch.empty(
+        (buffer_capacity, *sample_shape), device=device, dtype=torch.float32)
+    buffer_y = torch.empty(
+        (buffer_capacity, num_outputs), device=device, dtype=torch.float32)
+    buffer_cor = torch.empty(
+        (buffer_capacity, num_outputs), device=device, dtype=torch.float32)
+    ordered_slots = []
+    buffer_count = 0
+    seen_count = 0
+    train_accs, test_accs, train_mses, test_mses = [], [], [], []
+    beta_description = f", beta={der_beta:g}" if der_beta is not None else ""
+    replay_description = (
+        f", alpha={der_alpha:g}{beta_description}, m={replay_batch_size}"
+        if use_replay else ""
+    )
+    print(
+        f"{method_name}: task-frozen NTK TC, lr={hy_params_opt['sgd_lr']:g}, "
+        f"gamma={sgd_on_gm:g}, correction_eta={sgd_on_eta:g}, z_type={z_type}, "
+        f"on_cor_bs={on_cor_bs}, z_mini_bz={z_mini_bz}, M={buffer_capacity}"
+        f"{replay_description}"
+    )
+
+    def _ordered_slot_tensor():
+        return torch.as_tensor(ordered_slots, device=device, dtype=torch.long)
+
+    def _eval_prefix(N):
+        model.eval()
+        tr_acc, tr_mse = accuracy_cnn(
+            model, X_train[:N], y_train[:N],
+            device=device, gate_mode="none", true_gate_ids=None)
+        if hy_params['train_order_type'] == 'class_incremental':
+            X_te, y_te = incre_seen_test_subset(y_train[:N], X_test, y_test)
+            te_acc, te_mse = accuracy_cnn(
+                model, X_te, y_te, device=device, gate_mode="none", true_gate_ids=None)
+        elif hy_params['train_order_type'] == 'task_incremental':
+            if _task_incre_use_full_test_eval(hy_params):
+                te_acc, te_mse = accuracy_cnn(
+                    model, X_test, y_test,
+                    device=device, gate_mode="none", true_gate_ids=None)
+            else:
+                current_task_idx = (N - 1) // samples_per_task
+                X_te, y_te = incre_seen_test_subset_task_incremental(
+                    X_test, y_test, current_task_idx, total_tasks)
+                te_acc, te_mse = accuracy_cnn(
+                    model, X_te, y_te, device=device, gate_mode="none", true_gate_ids=None)
+        else:
+            te_acc, te_mse = accuracy_cnn(
+                model, X_test, y_test,
+                device=device, gate_mode="none", true_gate_ids=None)
+        return tr_acc, te_acc, tr_mse, te_mse
+
+    def _snapshot_reservoir():
+        if not ordered_slots:
+            return 0, None, None, None
+        slot_t = _ordered_slot_tensor()
+        x_m = buffer_x[slot_t].detach().clone()
+        y_m = buffer_y[slot_t].detach().cpu().numpy().astype(np.float64, copy=False)
+        z_m = buffer_cor[slot_t].detach().cpu().numpy().astype(np.float64, copy=False)
+        return int(slot_t.numel()), x_m, y_m, z_m
+
+    def _build_task_kernel(x_m, x_task, n_m, task_id):
+        model.eval()
+        if n_m > 0:
+            x_all = torch.cat([x_m, x_task], dim=0)
+        else:
+            x_all = x_task
+        print(
+            f"[{method_name}] task {task_id + 1}/{total_tasks}: "
+            f"frozen NTK on M={n_m} + N_task={int(x_task.shape[0])} "
+            f"(matrix {int(x_all.shape[0])} x {int(x_all.shape[0])})"
+        )
+        with torch.no_grad():
+            return _pairwise_empirical_ntk(model, x_all, x_all, hy_params)
+
+    def _sgd_and_reservoir(x_block, y_oh, z_block, step_n):
+        nonlocal buffer_count, seen_count
+        m = int(x_block.shape[0])
+        model.train()
+        for j in range(0, m, batch_size):
+            sl = slice(j, min(j + batch_size, m))
+            logits = model(x_block[sl])
+            if use_replay:
+                loss = mse_loss(logits, y_oh[sl])
+            else:
+                loss = mse_loss(logits, z_block[sl])
+            if use_replay and buffer_count > 0:
+                replay_size = min(replay_batch_size, buffer_count)
+                replay_idx = torch.randperm(buffer_count, device=device)[:replay_size]
+                replay_logits = model(buffer_x[replay_idx])
+                loss = loss + der_alpha * mse_loss(replay_logits, buffer_cor[replay_idx])
+                if der_beta is not None:
+                    loss = loss + der_beta * mse_loss(
+                        replay_logits, buffer_y[replay_idx])
+            if torch.isnan(loss) or torch.isinf(loss):
+                raise FloatingPointError(
+                    f"NaN/Inf {method_name} loss at step {step_n}")
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+
+        with torch.no_grad():
+            for row in range(m):
+                if seen_count < buffer_capacity:
+                    slot = seen_count
+                    buffer_count += 1
+                else:
+                    candidate = np.random.randint(0, seen_count + 1)
+                    slot = candidate if candidate < buffer_capacity else None
+                seen_count += 1
+                if slot is None:
+                    continue
+                slot = int(slot)
+                if slot in ordered_slots:
+                    ordered_slots.remove(slot)
+                ordered_slots.append(slot)
+                buffer_x[slot].copy_(x_block[row])
+                buffer_y[slot].copy_(y_oh[row])
+                buffer_cor[slot].copy_(z_block[row])
+
+    def _maybe_eval(end):
+        if end in niters_set or end == n_train or (
+                record_step > 0 and end % record_step == 0):
+            tr_acc, te_acc, tr_mse, te_mse = _eval_prefix(end)
+            train_accs.append(tr_acc)
+            test_accs.append(te_acc)
+            train_mses.append(tr_mse)
+            test_mses.append(te_mse)
+            print(
+                f"[{method_name}] N={end} | Train {tr_acc*100:.2f}% | "
+                f"Test {te_acc*100:.2f}% | buffer {buffer_count}/{buffer_capacity}"
+            )
+
+    for task_id in range(total_tasks):
+        task_start = task_id * samples_per_task
+        task_end = task_start + samples_per_task
+        n_m, x_m, y_m_np, z_m_np = _snapshot_reservoir()
+        x_task = torch.as_tensor(
+            X_train[task_start:task_end], dtype=torch.float32, device=device)
+        y_task_np = np.asarray(Y_train_oh[task_start:task_end], dtype=np.float64)
+        z_task_np = np.zeros_like(y_task_np)
+        k_tau = _build_task_kernel(x_m, x_task, n_m, task_id)
+
+        for offset in range(0, samples_per_task, on_cor_bs):
+            m = min(on_cor_bs, samples_per_task - offset)
+            start = task_start + offset
+            end = start + m
+            x_block = x_task[offset:offset + m]
+            y_np = y_task_np[offset:offset + m]
+            y_oh = torch.as_tensor(y_np, device=device, dtype=torch.float32)
+            n_p = n_m + offset
+            if n_p == 0:
+                z_np = y_np.copy()
+            else:
+                idx = np.arange(n_p + m, dtype=np.int64)
+                k_sub = k_tau[np.ix_(idx, idx)]
+                if n_m > 0:
+                    if offset > 0:
+                        y_p = np.concatenate([y_m_np, y_task_np[:offset]], axis=0)
+                        z_p = np.concatenate([z_m_np, z_task_np[:offset]], axis=0)
+                    else:
+                        y_p = y_m_np
+                        z_p = z_m_np
+                else:
+                    y_p = y_task_np[:offset]
+                    z_p = z_task_np[:offset]
+                z_np = _correct_targets_against_memory(
+                    k_sub, y_p, y_np, sgd_on_gm, sgd_on_eta, z_type, z_mini_bz,
+                    device, Z_mem=z_p)
+            z_block = torch.as_tensor(z_np, device=device, dtype=torch.float32)
+            z_task_np[offset:offset + m] = z_np
+            _sgd_and_reservoir(x_block, y_oh, z_block, end)
+            _maybe_eval(end)
+
+    return (
+        np.array(train_accs), np.array(test_accs),
+        np.array(train_mses), np.array(test_mses),
+    )
+
+
+def sgd_train_streaming_der_cor(
+        model, X_train, y_train, X_test, y_test, Niters, hy_params,
+        sgd_on_gm, sgd_on_eta, online_cor_type, gate_mode="none"):
+    del online_cor_type
+    if hy_params['train_order_type'] != 'task_incremental':
+        raise ValueError("DER corrected-target replay requires task_incremental ordering")
+    return sgd_train_streaming_reservoir_tc(
+        model, X_train, y_train, X_test, y_test, Niters, hy_params,
+        sgd_on_gm, sgd_on_eta, mode='der_cor', gate_mode=gate_mode)
+
+
+def train_core50_reservoir_tc(
+        model, X_train, y_train, X_test, y_test,
+        hy_params, num_epochs, batch_size,
+        num_tr_per_class, total_classes=50,
+        sgd_on_gm=100, sgd_on_eta=0.01, online_cor_type='batch_gpu',
+        mode='tc'):
+    del online_cor_type
+    mode = str(mode)
+    if mode not in ('tc', 'der_cor'):
+        raise ValueError(f"mode must be 'tc' or 'der_cor', got {mode!r}")
+    if hy_params['criterion'] != 'mse':
+        raise ValueError(f"{mode} currently supports criterion='mse' only")
+
+    use_replay = mode == 'der_cor'
+    device = hy_params['device']
+    n_train = int(len(y_train))
+    on_cor_bs = max(int(hy_params.get('on_cor_bs', 20)), 1)
+    if use_replay:
+        buffer_capacity = int(hy_params['der_buffer_size'])
+        replay_batch_size = int(hy_params['der_replay_batch_size'])
+        der_alpha = float(hy_params['der_alpha'])
+        der_beta = hy_params.get('der_beta', None)
+        if der_beta is not None:
+            der_beta = float(der_beta)
+        if buffer_capacity <= 0 or replay_batch_size <= 0:
+            raise ValueError("der_buffer_size and der_replay_batch_size must be positive")
+        if der_alpha < 0 or (der_beta is not None and der_beta < 0):
+            raise ValueError("DER alpha and beta must be non-negative")
+    else:
+        cor_tr_percent = float(hy_params.get('cor_tr_percent', 1.0))
+        buffer_capacity = int(hy_params.get(
+            'der_buffer_size', max(1, int(round(n_train * max(cor_tr_percent, 0.0))))))
+        if cor_tr_percent <= 0:
+            buffer_capacity = 1
+        replay_batch_size = 0
+        der_alpha = 0.0
+        der_beta = None
+
+    task_classes = CORE50_NC_TASK_CLASSES
+    start_task_boundaries, end_task_boundaries = [], []
+    end_index = 0
+    for n_cls in task_classes:
+        start_task_boundaries.append(end_index)
+        end_index += n_cls * num_tr_per_class
+        end_task_boundaries.append(end_index)
+    if end_index != n_train:
+        raise ValueError(
+            f"CORe50 task boundaries cover {end_index} samples, "
+            f"but y_train contains {n_train}"
+        )
+
+    model = model.to(device)
+    z_type = hy_params.get('z_type', 'both')
+    z_mini_bz = int(hy_params.get('z_mini_bz', 1))
+    method_name = "TC" if not use_replay else (
+        "DER++_cor" if der_beta is not None else "DER_cor")
+
+    sample_shape = tuple(torch.as_tensor(X_train[0]).shape)
+    buffer_x = torch.empty(
+        (buffer_capacity, *sample_shape), device=device, dtype=torch.float32)
+    buffer_y = torch.empty(
+        (buffer_capacity, total_classes), device=device, dtype=torch.float32)
+    buffer_cor = torch.empty(
+        (buffer_capacity, total_classes), device=device, dtype=torch.float32)
+    buffer_orig = np.full(buffer_capacity, -1, dtype=np.int64)
+    ordered_slots = []
+    buffer_count = 0
+    seen_count = 0
+    seen_mask = np.zeros(n_train, dtype=bool)
+
+    train_accs, test_accs, train_mses, test_mses = [], [], [], []
+    opt = optimizer(hy_params, model)
+    beta_description = f", beta={der_beta:g}" if der_beta is not None else ""
+    replay_description = (
+        f", alpha={der_alpha:g}{beta_description}, m={replay_batch_size}"
+        if use_replay else ""
+    )
+    print(
+        f"{method_name}: block-frozen NTK TC, lr={hy_params['sgd_lr']:g}, "
+        f"gamma={sgd_on_gm:g}, correction_eta={sgd_on_eta:g}, z_type={z_type}, "
+        f"on_cor_bs={on_cor_bs}, z_mini_bz={z_mini_bz}, "
+        f"epochs={num_epochs}, M={buffer_capacity}{replay_description}"
+    )
+
+    def _ordered_slot_tensor():
+        return torch.as_tensor(ordered_slots, device=device, dtype=torch.long)
+
+    def _snapshot_reservoir():
+        if not ordered_slots:
+            return 0, None, None, None
+        slot_t = _ordered_slot_tensor()
+        x_m = buffer_x[slot_t].detach().clone()
+        y_m = buffer_y[slot_t].detach().cpu().numpy().astype(np.float64, copy=False)
+        z_m = buffer_cor[slot_t].detach().cpu().numpy().astype(np.float64, copy=False)
+        return int(slot_t.numel()), x_m, y_m, z_m
+
+    def _build_block_kernel(x_m, x_task, n_m, task_id):
+        model.eval()
+        if n_m > 0:
+            x_all = torch.cat([x_m, x_task], dim=0)
+        else:
+            x_all = x_task
+        print(
+            f"[{method_name}] block {task_id + 1}/{len(task_classes)}: "
+            f"frozen NTK on M={n_m} + N_block={int(x_task.shape[0])} "
+            f"(matrix {int(x_all.shape[0])} x {int(x_all.shape[0])})"
+        )
+        return np.asarray(_pairwise_empirical_ntk(model, x_all, x_all, hy_params))
+
+    def _sgd_on_block(x_block, y_oh, z_block, task_id, epoch,
+                      orig_ids=None, update_reservoir=False):
+        nonlocal buffer_count, seen_count
+        m = int(x_block.shape[0])
+        model.train()
+        for j in range(0, m, batch_size):
+            sl = slice(j, min(j + batch_size, m))
+            logits = model(x_block[sl])
+            if use_replay:
+                loss = mse_loss(logits, y_oh[sl])
+            else:
+                loss = mse_loss(logits, z_block[sl])
+            if use_replay and buffer_count > 0:
+                replay_size = min(replay_batch_size, buffer_count)
+                replay_idx = torch.randperm(buffer_count, device=device)[:replay_size]
+                replay_logits = model(buffer_x[replay_idx])
+                loss = loss + der_alpha * mse_loss(replay_logits, buffer_cor[replay_idx])
+                if der_beta is not None:
+                    loss = loss + der_beta * mse_loss(
+                        replay_logits, buffer_y[replay_idx])
+            if torch.isnan(loss) or torch.isinf(loss):
+                raise FloatingPointError(
+                    f"NaN/Inf {method_name} loss at task {task_id + 1}, epoch {epoch}"
+                )
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+
+        if not update_reservoir:
+            return
+        with torch.no_grad():
+            for row in range(m):
+                orig_idx = int(orig_ids[row])
+                slot, seen_count, buffer_count = _unique_reservoir_slot(
+                    seen_mask, orig_idx, seen_count, buffer_count, buffer_capacity)
+                if slot is None:
+                    continue
+                slot = int(slot)
+                if slot in ordered_slots:
+                    ordered_slots.remove(slot)
+                ordered_slots.append(slot)
+                buffer_x[slot].copy_(x_block[row])
+                buffer_y[slot].copy_(y_oh[row])
+                buffer_cor[slot].copy_(z_block[row])
+                buffer_orig[slot] = orig_idx
+
+    for task_id, num_classes_in_task in enumerate(task_classes):
+        print(
+            f"--- Starting Task {task_id + 1}/{len(task_classes)} "
+            f"({num_classes_in_task} classes, {method_name}) ---"
+        )
+        start_tr = start_task_boundaries[task_id]
+        end_tr = end_task_boundaries[task_id]
+        n_task = end_tr - start_tr
+        x_task = torch.as_tensor(
+            X_train[start_tr:end_tr], dtype=torch.float32).to(device)
+        y_task_np = one_hot(np.asarray(y_train[start_tr:end_tr]), total_classes)
+        z_task_np = np.zeros_like(y_task_np)
+        n_m, x_m, y_m_np, z_m_np = _snapshot_reservoir()
+        k_tau = _build_block_kernel(x_m, x_task, n_m, task_id)
+
+        permutation = torch.randperm(n_task, device=device)
+        n_blocks = 0
+        past_local = np.zeros(0, dtype=np.int64)
+        for i in range(0, n_task, on_cor_bs):
+            local_t = permutation[i:i + on_cor_bs]
+            local_np = local_t.detach().cpu().numpy().astype(np.int64, copy=False)
+            orig_ids = (start_tr + local_np).astype(np.int64)
+            x_block = x_task[local_t]
+            y_np = y_task_np[local_np]
+            y_oh = torch.as_tensor(y_np, device=device, dtype=torch.float32)
+            n_p = n_m + int(past_local.size)
+            if n_p == 0:
+                z_np = y_np.copy()
+            else:
+                past_k = np.concatenate(
+                    [np.arange(n_m, dtype=np.int64), n_m + past_local])
+                curr_k = n_m + local_np
+                k_idx = np.concatenate([past_k, curr_k])
+                k_sub = k_tau[np.ix_(k_idx, k_idx)]
+                if n_m > 0:
+                    if past_local.size > 0:
+                        y_p = np.concatenate(
+                            [y_m_np, y_task_np[past_local]], axis=0)
+                        z_p = np.concatenate(
+                            [z_m_np, z_task_np[past_local]], axis=0)
+                    else:
+                        y_p = y_m_np
+                        z_p = z_m_np
+                else:
+                    y_p = y_task_np[past_local]
+                    z_p = z_task_np[past_local]
+                z_np = _correct_targets_against_memory(
+                    k_sub, y_p, y_np, sgd_on_gm, sgd_on_eta, z_type, z_mini_bz,
+                    device, Z_mem=z_p)
+            z_block = torch.as_tensor(z_np, device=device, dtype=torch.float32)
+            z_task_np[local_np] = z_np
+            _sgd_on_block(
+                x_block, y_oh, z_block, task_id, epoch=0,
+                orig_ids=orig_ids, update_reservoir=True)
+            past_local = np.concatenate([past_local, local_np])
+            n_blocks += 1
+        print(
+            f"[{method_name}] task={task_id + 1}, epoch=1: "
+            f"{n_blocks} correction blocks of on_cor_bs={on_cor_bs}, "
+            f"reservoir {buffer_count}/{buffer_capacity} "
+            f"(frozen z^c for remaining epochs)"
+        )
+
+        z_task = torch.as_tensor(z_task_np, device=device, dtype=torch.float32)
+        y_task_oh = torch.as_tensor(y_task_np, device=device, dtype=torch.float32)
+        for epoch in range(1, num_epochs):
+            permutation = torch.randperm(n_task, device=device)
+            for i in range(0, n_task, batch_size):
+                local_t = permutation[i:i + batch_size]
+                _sgd_on_block(
+                    x_task[local_t], y_task_oh[local_t], z_task[local_t],
+                    task_id, epoch, update_reservoir=False)
+            print(
+                f"[{method_name}] task={task_id + 1}, epoch={epoch + 1}: "
+                f"reuse epoch-1 z^c, reservoir frozen at "
+                f"{buffer_count}/{buffer_capacity}"
+            )
+
+        tr_acc, te_acc, tr_mse, te_mse = _core50_eval_full(
+            model, X_train, y_train, X_test, y_test, device)
+        train_accs.append(tr_acc)
+        test_accs.append(te_acc)
+        train_mses.append(tr_mse)
+        test_mses.append(te_mse)
+        print(
+            f"Task {task_id + 1} | Full Train Acc: {tr_acc*100:.2f}% | "
+            f"Full Test Acc: {te_acc*100:.2f}% | "
+            f"buffer {buffer_count}/{buffer_capacity}, unique_seen={seen_count}"
+        )
+
+    return (
+        np.array(train_accs), np.array(test_accs),
+        np.array(train_mses), np.array(test_mses),
+    )
+
+
+def train_core50_der_cor(
+        model, X_train, y_train, X_test, y_test,
+        hy_params, num_epochs, batch_size,
+        num_tr_per_class, total_classes=50,
+        sgd_on_gm=100, sgd_on_eta=0.01, online_cor_type='batch_gpu'):
+    return train_core50_reservoir_tc(
+        model, X_train, y_train, X_test, y_test,
+        hy_params, num_epochs, batch_size,
+        num_tr_per_class, total_classes=total_classes,
+        sgd_on_gm=sgd_on_gm, sgd_on_eta=sgd_on_eta,
+        online_cor_type=online_cor_type, mode='der_cor')
+
